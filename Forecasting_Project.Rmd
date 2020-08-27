@@ -1,0 +1,222 @@
+---
+title: "Forecasting Project"
+author: "Lanxiang Shao"
+date: "Spring 2020"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(forecast)
+library(ggplot2)
+library(urca)
+```
+
+
+# Data Preparation
+* Load the data & Convert to ts (The dataset has been seasonally adjusted when posted on FRED)
+* Plot related graphs to get the general sense of the data
+* Take log of the data
+* Data partrition
+
+```{r,message=FALSE}
+#load UK real GDP (source: FRED)
+UKGDP <- read_csv("CLVMNACSCAB1GQUK.csv")
+
+#change column name to UK Real GDP, easy to recognize
+names(UKGDP)[names(UKGDP) == 'CLVMNACSCAB1GQUK'] <- 'UKRealGDP'
+
+#convert to TS, this is quarterly
+gdp.ts = ts(UKGDP$UKRealGDP,start = c(1975,1), frequency = 4)
+
+#plot general TS
+plot(gdp.ts, ylab = 'UK Real GDP (Millions of National Currency)',xlab='Year',lwd=1.5)
+grid()
+
+#chech ACF,PACF plots
+ggAcf(gdp.ts,lag.max = 50)
+ggPacf(gdp.ts)
+#ACF decays slowly, PACF drops to zero at model length, suitable for AR model
+
+#Plot the quarterly growth rates for the entire series
+growth_rates = diff(log(gdp.ts ))
+plot(growth_rates, xlab = 'Time',ylab = "GDP Growth Rate (quarterly)")
+grid()
+
+# Since the gdp number is too big, not easy to read and plot, let's go to logs right away
+gdp.ts.log = ts(log(UKGDP$UKRealGDP),start = c(1975,1), frequency = 4)
+
+#partition the data (80% for training data, 20% for valid data)
+train.ts = window(gdp.ts.log,start = c(1975,1), end = c(2010,4))
+valid.ts = window(gdp.ts.log,start = c(2011,1), end = c(2019,4))
+
+#length of valid data
+nvalid = length(time(valid.ts))
+
+```
+According to the plot, my data shows a clear ascending trend. Since the data is already seasonally adjusted, I do not need to take the seasonality manually.
+
+# DF Test (Test 3, with trend)
+```{r}
+#ADF test on unit root data, use the auto lag selection feature with the BIC
+df.test = ur.df(gdp.ts.log, type = 'trend', selectlags = 'BIC')
+print('Trend ADF Test')
+print(summary(df.test))
+
+sumStats <- summary(df.test)
+teststat <- sumStats@teststat[1]
+critical <- sumStats@cval[3]  #test 3
+print(teststat)
+print(critical)
+print(teststat<critical)
+
+```
+* Fail to reject the null. The data is not stationary.
+
+* [How to choose model?]
+* For non-stationary model, the average is dependent on time.
+* The ARMA(p,q) does not trend up or down over time (stationarity). Non-stationary data cannot be implemented in a typical ARMA format.
+
+* So, What can I do?
+* Detrend the data (with linear model, and then look at residuals)
+* OR
+* Fit trend into an ARMA model (easier for forecasting)[My Pick]
+
+* Arima function fits a wide class of ARMA models
+* Controlled by order parameter (p,d,q)
+* ARIMA(AR,d,MA), or ARIMA(p,d,q)
+
+* For my own model, I am going to use ARIMA model, taking the first difference of the data to reduce the possible bias. 
+```{r}
+#Find the order paraneter for my model.
+#Let's take first difference
+diff.ts <- diff(gdp.ts.log)
+plot(diff.ts)
+#Let's see how many lags with PACF
+ggPacf(diff.ts)     #2 significant lags
+#Anything left in ACF
+ggAcf(diff.ts)      #3 significant lags
+
+#The differenced series displays an AR(1) signature, that is fitting an ARIMA(1,1,0) model
+```
+
+
+# Process my ARIMA model
+```{r}
+# ARIMA(d=1) model, take first difference due to its non-stationarity
+gdp.mod <- Arima(train.ts,order=c(1,1,0),include.constant = TRUE )  
+
+# forecast (95% confidence interval)
+gdp.fcast <- forecast(gdp.mod,h=nvalid,level=95)
+plot(gdp.fcast)
+lines(gdp.fcast$fitted,col = 'orange')
+lines(valid.ts, col='red', lwd = 1.5)
+grid()
+
+print('ARIMA Model Performance')
+print(accuracy(gdp.fcast,valid.ts))
+```
+
+
+
+# Baseline Models
+
+### auto.arima (Use BIC info to choose model, BIC is a larger penalty at longer time horizons)
+```{r}
+gdp.mod.bic <- auto.arima(train.ts,d=1,ic="bic",seasonal=FALSE)
+
+# forecast (95% confidence interval)
+gdp.fcast.bic <- forecast(gdp.mod.bic,h=nvalid,level=95)
+plot(gdp.fcast.bic,lwd=2)
+lines(gdp.fcast.bic$fitted,col = 'orange')
+lines(valid.ts,col='red',lwd = 1.5)
+grid()
+
+print('auto.ARIMA Model Performance (BIC Selection)')
+print(accuracy(gdp.fcast.bic,valid.ts))
+
+#DM Test
+#one accepted forecasting system:ARIMA model(e1) VS a challeger(e2)
+#I want to know if sqr(e2) < sqr(e1). If this is true, the new forecasting system connected to e2 would be beter.
+#This suggests a null hypothesis sqr(e2) >= sqr(e1), and an alternative where sqr(e2) < sqr(e1).
+#In R this would be dm.test(e2,e1,alternative=”less”)
+
+print("Diebold/Mariano ARIMA versus auto.ARIMA (BIC Selection): alternative = less")
+print(dm.test(residuals(gdp.fcast.bic),residuals(gdp.fcast),alternative="less"))
+
+```
+P-value = 0.1263 in DM_test test, fail to reject the null at 5% level.
+
+So, the sqrt residual of the auto.ARIMA model is larger than the sqrt residual of the ARIMA model.
+The ARIMA model is better than auto.ARIMA model based on the DM Test.
+
+
+
+### Naive model 
+```{r}
+# Find naive forecast
+gdp.naive.drift <-  rwf(train.ts, h = nvalid, drift = TRUE, level = 95)
+
+# plot the forecast in the validation period
+plot(gdp.naive.drift)
+lines(gdp.naive.drift$mean,col="blue",lwd=2)
+lines(valid.ts,lty="dashed")
+grid()
+
+print(accuracy(gdp.naive.drift,valid.ts))
+
+print("Diebold/Mariano ARIMA versus naive test: alternative = less")
+print(dm.test(residuals(gdp.naive.drift),residuals(gdp.fcast),alternative="less"))
+
+```
+P-value = 0.7726 in DM_test test, fail to reject the null at 5% level.
+
+So, the sqrt residual of the naive model is larger than the sqrt residual of the ARIMA model.
+The ARIMA model is better than the naive model based on the DM Test.
+
+
+### ETS
+```{r}
+#Level + Trend, Holts linear model, AAN (data is seasonally adjusted)
+ses = ets(train.ts, model = 'AAN',opt.crit = 'mse') #let the model itself finds out the optimal parameter 
+ses.pred = forecast(ses,h = nvalid, level = 95)
+
+#plot the forecasts, fitted value and valid data
+plot(ses.pred, ylab = 'GDP(log)',xlab = 'Time',bty = 'l', main = '', flty=2)
+lines(ses.pred$fitted, lwd=1,col="orange")
+lines(valid.ts)
+grid()
+#add partition line and training/validation mark
+ntrain = length(time(train.ts))
+valid2x = 1975 + (0+ntrain)/4
+lines(c(valid2x,valid2x),c(-40,120),lwd = 1, col = 'black')
+text(2000,12.4,'Training',cex = 1.25)
+text(2015,12.4,'Validation',cex = 1.25)
+
+#find out the accuracy of the model, check the performance
+print('ETS Model Performance')
+print(accuracy(ses.pred,valid.ts))
+
+print("Diebold/Mariano ARIMA versus Holts linear model: alternative = less")
+print(dm.test(residuals(ses.pred),residuals(gdp.fcast),alternative="less"))
+
+```
+P-value = 0.3452 in DM_test test, fail to reject the null at 5% level.
+
+So, the sqrt residual of the Holts linear model is larger than the sqrt residual of the ARIMA model.
+The ARIMA model is better than the naive model based on the DM Test.
+
+
+## RMSE Comparison
+```{r}
+paste('The RMSE for ARIMA (my model) is',accuracy(gdp.fcast,valid.ts)[2,2])
+paste('The RMSEs for three baseline models are:')
+paste(accuracy(gdp.fcast.bic,valid.ts)[2,2],'(AUTO.ARIMA)')
+paste(accuracy(gdp.naive.drift,valid.ts)[2,2],'(Naive)')
+paste(accuracy(ses.pred,valid.ts)[2,2],'(ETS)')
+
+```
+According to the results, one of the baseline models,auto.arima model (2,1,0), has the smallest RMSE, meaning a better model performance than other models. However, based on the DM Tests, my model, ARIMA(1,1,0), outperforms than others, that is having a smaller sqrt error than others. As you can see in the plots, the forecasting plots of auto.arima model (2,1,0) and my model ARIMA(1,1,0) are pretty similar. Therefore, I think auto.arima model (2,1,0) and my model ARIMA(1,1,0) both perform well and are doing much better than other models, like naive and ETS models.

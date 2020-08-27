@@ -1,2 +1,2 @@
 # Forecasting-Models-R
-Used time series models to conduct prediction of UK GDP
+Used time series models to conduct prediction of UK GDP (R)
